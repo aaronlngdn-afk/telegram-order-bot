@@ -1,5 +1,9 @@
 import logging
 import sqlite3
+import json
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,6 +19,17 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
 ADMIN_IDS = {123456789}
 DB_PATH = "orders.db"
+
+# ---------- GitHub sync config ----------
+# Personal access token with 'repo' scope. Keep this secret - use an
+# environment variable in production instead of hardcoding it.
+GITHUB_TOKEN = "YOUR_GITHUB_TOKEN_HERE"
+GITHUB_OWNER = "aaronlngdn-afk"
+GITHUB_REPO = "telegram-order-bot"
+GITHUB_BRANCH = "main"
+GITHUB_ORDERS_DIR = "orders"
+GITHUB_API_BASE = "https://api.github.com"
+SYNC_ORDERS_TO_GITHUB = True  # set False to disable GitHub syncing
 
 (SELECT_CATEGORY, SELECT_PRODUCT, ENTER_QTY, CART_MENU,
  CHECKOUT_NAME, CHECKOUT_PHONE, CHECKOUT_ADDRESS, CHECKOUT_CONFIRM,
@@ -39,6 +54,7 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_number TEXT UNIQUE,
             user_id INTEGER NOT NULL,
             username TEXT,
             customer_name TEXT,
@@ -72,6 +88,106 @@ def init_db():
                 "INSERT INTO products (name, category, price) VALUES (?,?,?)",
                 sample
             )
+
+
+def generate_order_number(order_id: int) -> str:
+    """Human friendly order number, e.g. ORD-20260726-0007"""
+    date_part = datetime.utcnow().strftime("%Y%m%d")
+    return f"ORD-{date_part}-{order_id:04d}"
+
+
+def github_request(method, path, payload=None):
+    if not GITHUB_TOKEN or GITHUB_TOKEN == "YOUR_GITHUB_TOKEN_HERE":
+        logger.warning("GitHub token not configured, skipping GitHub sync.")
+        return None
+    url = f"{GITHUB_API_BASE}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", f"Bearer {GITHUB_TOKEN}")
+    req.add_header("Accept", "application/vnd.github+json")
+    req.add_header("User-Agent", "telegram-order-bot")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        logger.error(f"GitHub API error {e.code}: {e.read().decode()}")
+        return None
+    except Exception as e:
+        logger.error(f"GitHub API request failed: {e}")
+        return None
+
+
+def push_order_to_github(order_number, order_row, items):
+    """Create an organized markdown file for the order in the orders/ folder,
+    plus update a running orders/INDEX.md summary table."""
+    if not SYNC_ORDERS_TO_GITHUB:
+        return
+
+    created = order_row["created_at"][:10]
+    file_path = f"{GITHUB_ORDERS_DIR}/{created}/{order_number}.md"
+
+    lines = [
+        f"# Order {order_number}",
+        "",
+        f"- **Status:** {order_row['status']}",
+        f"- **Customer:** {order_row['customer_name']}",
+        f"- **Phone:** {order_row['phone']}",
+        f"- **Address:** {order_row['address']}",
+        f"- **Telegram user:** @{order_row['username'] or order_row['user_id']}",
+        f"- **Placed at (UTC):** {order_row['created_at']}",
+        "",
+        "## Items",
+        "",
+        "| Product | Qty | Price | Subtotal |",
+        "|---|---|---|---|",
+    ]
+    for it in items:
+        subtotal = it["qty"] * it["price"]
+        lines.append(f"| {it['product_name']} | {it['qty']} | ${it['price']:.2f} | ${subtotal:.2f} |")
+    lines.append("")
+    lines.append(f"**Total: ${order_row['total']:.2f}**")
+    content = "\n".join(lines)
+
+    encoded = base64.b64encode(content.encode()).decode()
+    body = {
+        "message": f"Add order {order_number}",
+        "content": encoded,
+        "branch": GITHUB_BRANCH,
+    }
+    path = f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{file_path}"
+    result = github_request("PUT", path, body)
+    if result:
+        logger.info(f"Order {order_number} pushed to GitHub at {file_path}")
+    update_orders_index(order_number, order_row, file_path)
+
+
+def update_orders_index(order_number, order_row, file_path):
+    """Append a row to orders/INDEX.md so all orders are browsable in one place."""
+    index_path_api = f"/repos/{GITHUB_OWNER}/{GITHUB_REPO}/contents/{GITHUB_ORDERS_DIR}/INDEX.md"
+    existing = github_request("GET", index_path_api + f"?ref={GITHUB_BRANCH}")
+
+    header = "# Orders Index\n\n| Order # | Date | Customer | Total | Status | Link |\n|---|---|---|---|---|---|\n"
+    row = (f"| {order_number} | {order_row['created_at'][:10]} | {order_row['customer_name']} "
+           f"| ${order_row['total']:.2f} | {order_row['status']} | [view]({file_path}) |\n")
+
+    if existing and "content" in existing:
+        current = base64.b64decode(existing["content"]).decode()
+        new_content = current.rstrip("\n") + "\n" + row
+        sha = existing["sha"]
+    else:
+        new_content = header + row
+        sha = None
+
+    body = {
+        "message": f"Update orders index for {order_number}",
+        "content": base64.b64encode(new_content.encode()).decode(),
+        "branch": GITHUB_BRANCH,
+    }
+    if sha:
+        body["sha"] = sha
+    github_request("PUT", index_path_api, body)
 
 
 def get_categories():
@@ -114,7 +230,7 @@ def cart_text(context):
     items = cart(context)
     if not items:
         return "Your cart is empty."
-    lines = ["\U0001F6D2 Your Cart:"]
+    lines = ["Your Cart:"]
     for pid, qty in items.items():
         p = get_product(pid)
         if p:
@@ -241,212 +357,3 @@ async def back_to_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await start_from_query(query, context)
     return SELECT_CATEGORY
-
-
-async def start_checkout(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not cart(context):
-        await query.edit_message_text("Your cart is empty. Add items first.")
-        return SELECT_CATEGORY
-    await query.edit_message_text("Let's checkout. Please enter your full name:")
-    return CHECKOUT_NAME
-
-
-async def checkout_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["checkout_name"] = update.message.text
-    await update.message.reply_text("Enter your phone number:")
-    return CHECKOUT_PHONE
-
-
-async def checkout_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["checkout_phone"] = update.message.text
-    await update.message.reply_text("Enter your delivery address:")
-    return CHECKOUT_ADDRESS
-
-
-async def checkout_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["checkout_address"] = update.message.text
-    summary = cart_text(context)
-    name = context.user_data["checkout_name"]
-    phone = context.user_data["checkout_phone"]
-    address = context.user_data["checkout_address"]
-    keyboard = [
-        [InlineKeyboardButton("Confirm Order", callback_data="confirm_order")],
-        [InlineKeyboardButton("Cancel", callback_data="back_start")],
-    ]
-    text = (f"{summary}\n\nName: {name}\nPhone: {phone}\nAddress: {address}\n\n"
-            f"Confirm your order?")
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return CHECKOUT_CONFIRM
-
-
-async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user = query.from_user
-    items = cart(context)
-    total = cart_total(context)
-    with db() as conn:
-        cur = conn.execute(
-            "INSERT INTO orders (user_id, username, customer_name, phone, address, status, total, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?)",
-            (user.id, user.username or "", context.user_data["checkout_name"],
-             context.user_data["checkout_phone"], context.user_data["checkout_address"],
-             "pending", total, datetime.utcnow().isoformat())
-        )
-        order_id = cur.lastrowid
-        for pid, qty in items.items():
-            p = get_product(pid)
-            if p:
-                conn.execute(
-                    "INSERT INTO order_items (order_id, product_id, product_name, qty, price) "
-                    "VALUES (?,?,?,?,?)",
-                    (order_id, pid, p["name"], qty, p["price"])
-                )
-    context.user_data["cart"] = {}
-    await query.edit_message_text(
-        f"Order #{order_id} placed successfully! Total: ${total:.2f}\n"
-        f"We'll contact you soon regarding delivery."
-    )
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                admin_id,
-                f"New order #{order_id} from {context.user_data.get('checkout_name')} "
-                f"({user.username or user.id}) - Total: ${total:.2f}"
-            )
-        except Exception as e:
-            logger.warning(f"Could not notify admin {admin_id}: {e}")
-    return ConversationHandler.END
-
-
-async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10", (user_id,)
-        ).fetchall()
-    if not rows:
-        text = "You have no orders yet."
-    else:
-        lines = ["Your recent orders:"]
-        for r in rows:
-            lines.append(f"#{r['id']} - {r['status']} - ${r['total']:.2f} - {r['created_at'][:16]}")
-        text = "\n".join(lines)
-    keyboard = [[InlineKeyboardButton("Back", callback_data="back_start")]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return SELECT_CATEGORY
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Operation cancelled.")
-    return ConversationHandler.END
-
-
-async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Not authorized.")
-        return
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM orders ORDER BY id DESC LIMIT 20"
-        ).fetchall()
-    if not rows:
-        await update.message.reply_text("No orders yet.")
-        return
-    lines = ["Recent orders:"]
-    for r in rows:
-        lines.append(
-            f"#{r['id']} | {r['status']} | ${r['total']:.2f} | {r['customer_name']} | {r['phone']}"
-        )
-    await update.message.reply_text("\n".join(lines))
-
-
-async def admin_setstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Not authorized.")
-        return
-    if len(context.args) < 2:
-        await update.message.reply_text("Usage: /setstatus <order_id> <status>")
-        return
-    order_id, status = context.args[0], context.args[1]
-    with db() as conn:
-        conn.execute("UPDATE orders SET status=? WHERE id=?", (status, order_id))
-    await update.message.reply_text(f"Order #{order_id} status updated to {status}.")
-
-
-async def admin_addproduct(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("Not authorized.")
-        return
-    if len(context.args) < 3:
-        await update.message.reply_text("Usage: /addproduct <name> <category> <price>")
-        return
-    name, category, price = context.args[0], context.args[1], context.args[2]
-    try:
-        price = float(price)
-    except ValueError:
-        await update.message.reply_text("Price must be a number.")
-        return
-    with db() as conn:
-        conn.execute(
-            "INSERT INTO products (name, category, price) VALUES (?,?,?)",
-            (name, category, price)
-        )
-    await update.message.reply_text(f"Product '{name}' added to {category} at ${price:.2f}.")
-
-
-def main():
-    init_db()
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            SELECT_CATEGORY: [
-                CallbackQueryHandler(browse_categories, pattern="^browse$"),
-                CallbackQueryHandler(view_cart, pattern="^view_cart$"),
-                CallbackQueryHandler(my_orders, pattern="^my_orders$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_start$"),
-            ],
-            SELECT_PRODUCT: [
-                CallbackQueryHandler(show_products, pattern="^cat:"),
-                CallbackQueryHandler(ask_quantity, pattern="^prod:"),
-                CallbackQueryHandler(browse_categories, pattern="^browse$"),
-            ],
-            ENTER_QTY: [
-                CallbackQueryHandler(add_to_cart, pattern="^qty:"),
-                CallbackQueryHandler(show_products, pattern="^cat:"),
-            ],
-            CART_MENU: [
-                CallbackQueryHandler(browse_categories, pattern="^browse$"),
-                CallbackQueryHandler(view_cart, pattern="^view_cart$"),
-                CallbackQueryHandler(clear_cart, pattern="^clear_cart$"),
-                CallbackQueryHandler(start_checkout, pattern="^checkout$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_start$"),
-            ],
-            CHECKOUT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_name)],
-            CHECKOUT_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_phone)],
-            CHECKOUT_ADDRESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, checkout_address)],
-            CHECKOUT_CONFIRM: [
-                CallbackQueryHandler(confirm_order, pattern="^confirm_order$"),
-                CallbackQueryHandler(back_to_start, pattern="^back_start$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
-    app.add_handler(conv_handler)
-    app.add_handler(CommandHandler("orders", admin_orders))
-    app.add_handler(CommandHandler("setstatus", admin_setstatus))
-    app.add_handler(CommandHandler("addproduct", admin_addproduct))
-
-    logger.info("Bot started polling...")
-    app.run_polling()
-
-
-if __name__ == "__main__":
-    main()
